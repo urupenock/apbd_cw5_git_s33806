@@ -10,42 +10,39 @@ namespace LegacyRenewalApp
         private readonly ISubscriptionPlanRepository _planRepository;
         private readonly IBillingServices _billingService;
         private readonly ITaxService _taxService;
-        private readonly IDiscountService _discountService; 
+        private readonly IDiscountService _discountService;
+        private readonly IPaymentFeeService _paymentFeeService; 
         
         public SubscriptionRenewalService() : this(
             new CustomerRepository(), 
             new SubscriptionPlanRepository(), 
             new LegacyBillingServiceAdapter(),
             new TaxService(),
-            new DiscountService()) 
+            new DiscountService(),
+            new PaymentFeeService()) 
         {
         }
+        
         public SubscriptionRenewalService(
             ICustomerRepository customerRepository,
             ISubscriptionPlanRepository planRepository,
             IBillingServices billingService,
             ITaxService taxService,
-            IDiscountService discountService) 
+            IDiscountService discountService,
+            IPaymentFeeService paymentFeeService) 
         {
             _customerRepository = customerRepository;
             _planRepository = planRepository;
             _billingService = billingService;
             _taxService = taxService;
             _discountService = discountService;
+            _paymentFeeService = paymentFeeService; 
         }
 
-        public RenewalInvoice CreateRenewalInvoice(
-            int customerId,
-            string planCode,
-            int seatCount,
-            string paymentMethod,
-            bool includePremiumSupport,
-            bool useLoyaltyPoints)
+        public RenewalInvoice CreateRenewalInvoice(int customerId, string planCode, int seatCount, 
+            string paymentMethod, bool includePremiumSupport, bool useLoyaltyPoints)
         {
-            if (customerId <= 0) throw new ArgumentException("Customer id must be positive");
-            if (string.IsNullOrWhiteSpace(planCode)) throw new ArgumentException("Plan code is required");
-            if (seatCount <= 0) throw new ArgumentException("Seat count must be positive");
-            if (string.IsNullOrWhiteSpace(paymentMethod)) throw new ArgumentException("Payment method is required");
+            ValidateInput(customerId, planCode, seatCount, paymentMethod);
 
             string normalizedPlanCode = planCode.Trim().ToUpperInvariant();
             string normalizedPaymentMethod = paymentMethod.Trim().ToUpperInvariant();
@@ -54,79 +51,70 @@ namespace LegacyRenewalApp
             var plan = _planRepository.GetByCode(normalizedPlanCode);
 
             if (customer == null) throw new InvalidOperationException("Customer not found");
-            if (!customer.IsActive)
-            {
-                throw new InvalidOperationException("Inactive customers cannot renew subscriptions");
-            }
+            if (!customer.IsActive) throw new InvalidOperationException("Inactive customers cannot renew");
             
             decimal baseAmount = (plan.MonthlyPricePerSeat * seatCount * 12m) + plan.SetupFee;
-            
             var discount = _discountService.CalculateTotalDiscount(customer, plan, seatCount, baseAmount, useLoyaltyPoints);
+            
             decimal discountAmount = discount.Amount;
             string notes = discount.Description;
 
-            decimal subtotalAfterDiscount = baseAmount - discountAmount;
-            if (subtotalAfterDiscount < 300m)
-            {
-                subtotalAfterDiscount = 300m;
-                notes += "minimum discounted subtotal applied; ";
-            }
-            
-            decimal supportFee = 0m;
-            if (includePremiumSupport)
-            {
-                if (normalizedPlanCode == "START") supportFee = 250m;
-                else if (normalizedPlanCode == "PRO") supportFee = 400m;
-                else if (normalizedPlanCode == "ENTERPRISE") supportFee = 700m;
-                notes += "premium support included; ";
-            }
+            decimal subtotalAfterDiscount = Math.Max(baseAmount - discountAmount, 300m);
+            if (baseAmount - discountAmount < 300m) notes += "minimum discounted subtotal applied; ";
 
-            decimal paymentFee = 0m;
-            if (normalizedPaymentMethod == "CARD") paymentFee = (subtotalAfterDiscount + supportFee) * 0.02m;
-            else if (normalizedPaymentMethod == "BANK_TRANSFER") paymentFee = (subtotalAfterDiscount + supportFee) * 0.01m;
-            else if (normalizedPaymentMethod == "PAYPAL") paymentFee = (subtotalAfterDiscount + supportFee) * 0.035m;
-            else if (normalizedPaymentMethod == "INVOICE") paymentFee = 0m;
-            else throw new ArgumentException("Unsupported payment method");
+            decimal supportFee = CalculateSupportFee(normalizedPlanCode, includePremiumSupport, ref notes);
+
+            decimal paymentFee = _paymentFeeService.CalculateFee(normalizedPaymentMethod, subtotalAfterDiscount + supportFee);
+            if (paymentFee > 0 || normalizedPaymentMethod != "INVOICE") notes += $"{normalizedPaymentMethod.ToLower()} fee; ";
             
             decimal taxRate = _taxService.GetTaxRate(customer.Country);
-
             decimal taxBase = subtotalAfterDiscount + supportFee + paymentFee;
             decimal taxAmount = taxBase * taxRate;
-            decimal finalAmount = taxBase + taxAmount;
-
-            if (finalAmount < 500m)
-            {
-                finalAmount = 500m;
-                notes += "minimum invoice amount applied; ";
-            }
+            decimal finalAmount = Math.Max(taxBase + taxAmount, 500m);
+            if (taxBase + taxAmount < 500m) notes += "minimum invoice amount applied; ";
             
-            var invoice = new RenewalInvoice
-            {
-                InvoiceNumber = $"INV-{DateTime.UtcNow:yyyyMMdd}-{customerId}-{normalizedPlanCode}",
-                CustomerName = customer.FullName,
-                PlanCode = normalizedPlanCode,
-                PaymentMethod = normalizedPaymentMethod,
-                SeatCount = seatCount,
-                BaseAmount = Math.Round(baseAmount, 2, MidpointRounding.AwayFromZero),
-                DiscountAmount = Math.Round(discountAmount, 2, MidpointRounding.AwayFromZero),
-                SupportFee = Math.Round(supportFee, 2, MidpointRounding.AwayFromZero),
-                PaymentFee = Math.Round(paymentFee, 2, MidpointRounding.AwayFromZero),
-                TaxAmount = Math.Round(taxAmount, 2, MidpointRounding.AwayFromZero),
-                FinalAmount = Math.Round(finalAmount, 2, MidpointRounding.AwayFromZero),
-                Notes = notes.Trim(),
-                GeneratedAt = DateTime.UtcNow
-            };
+            var invoice = BuildInvoice(customerId, customer.FullName, normalizedPlanCode, normalizedPaymentMethod, 
+                seatCount, baseAmount, discountAmount, supportFee, paymentFee, taxAmount, finalAmount, notes);
 
             _billingService.SaveInvoice(invoice);
-
-            if (!string.IsNullOrWhiteSpace(customer.Email))
-            {
-                string subject = "Subscription renewal invoice";
-                string body = $"Hello {customer.FullName}, your renewal for plan {normalizedPlanCode} has been prepared. Final amount: {invoice.FinalAmount:F2}.";
-                _billingService.SendEmail(customer.Email, subject, body);
-            }
+            SendNotification(customer, normalizedPlanCode, invoice);
 
             return invoice;
+        }
+        
+        private void ValidateInput(int id, string code, int seats, string method)
+        {
+            if (id <= 0) throw new ArgumentException("Customer id must be positive");
+            if (string.IsNullOrWhiteSpace(code)) throw new ArgumentException("Plan code is required");
+            if (seats <= 0) throw new ArgumentException("Seat count must be positive");
+            if (string.IsNullOrWhiteSpace(method)) throw new ArgumentException("Payment method is required");
+        }
+
+        private decimal CalculateSupportFee(string plan, bool include, ref string notes)
+        {
+            if (!include) return 0m;
+            notes += "premium support included; ";
+            return plan switch { "START" => 250m, "PRO" => 400m, "ENTERPRISE" => 700m, _ => 0m };
+        }
+
+        private RenewalInvoice BuildInvoice(int cId, string name, string plan, string method, int seats, 
+            decimal baseAmt, decimal discAmt, decimal suppFee, decimal payFee, decimal taxAmt, decimal finalAmt, string notes)
+        {
+            return new RenewalInvoice {
+                InvoiceNumber = $"INV-{DateTime.UtcNow:yyyyMMdd}-{cId}-{plan}",
+                CustomerName = name, PlanCode = plan, PaymentMethod = method, SeatCount = seats,
+                BaseAmount = Math.Round(baseAmt, 2), DiscountAmount = Math.Round(discAmt, 2),
+                SupportFee = Math.Round(suppFee, 2), PaymentFee = Math.Round(payFee, 2),
+                TaxAmount = Math.Round(taxAmt, 2), FinalAmount = Math.Round(finalAmt, 2),
+                Notes = notes.Trim(), GeneratedAt = DateTime.UtcNow
+            };
+        }
+
+        private void SendNotification(Customer customer, string plan, RenewalInvoice invoice)
+        {
+            if (string.IsNullOrWhiteSpace(customer.Email)) return;
+            string body = $"Hello {customer.FullName}, your renewal for {plan} is ready. Total: {invoice.FinalAmount:F2}.";
+            _billingService.SendEmail(customer.Email, "Subscription renewal invoice", body);
         }
     }
 }
